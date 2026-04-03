@@ -149,20 +149,32 @@ impl HotkeyConfig {
             .collect::<Vec<_>>();
         let key_value = self.key.trim().to_ascii_lowercase();
 
-        let no_modifier = modifier_parts.len() == 1
-            && matches_token(&modifier_parts[0], &["none", "", "null"]);
+        let no_modifier =
+            modifier_parts.len() == 1 && matches_token(&modifier_parts[0], &["none", "", "null"]);
         if key_value == "f8" && no_modifier {
             return HotkeyModeConfig::Known(HotkeyMode::F8Hold);
         }
 
-        let modifier_has_rctrl = modifier_parts
-            .iter()
-            .any(|part| matches_token(part, &["rctrl", "rightctrl", "right_control", "control_right"]));
-        let modifier_has_rshift = modifier_parts
-            .iter()
-            .any(|part| matches_token(part, &["rshift", "rightshift", "right_shift", "shift_right"]));
-        let key_is_rctrl = matches_token(&key_value, &["rctrl", "rightctrl", "right_control", "control_right"]);
-        let key_is_rshift = matches_token(&key_value, &["rshift", "rightshift", "right_shift", "shift_right"]);
+        let modifier_has_rctrl = modifier_parts.iter().any(|part| {
+            matches_token(
+                part,
+                &["rctrl", "rightctrl", "right_control", "control_right"],
+            )
+        });
+        let modifier_has_rshift = modifier_parts.iter().any(|part| {
+            matches_token(
+                part,
+                &["rshift", "rightshift", "right_shift", "shift_right"],
+            )
+        });
+        let key_is_rctrl = matches_token(
+            &key_value,
+            &["rctrl", "rightctrl", "right_control", "control_right"],
+        );
+        let key_is_rshift = matches_token(
+            &key_value,
+            &["rshift", "rightshift", "right_shift", "shift_right"],
+        );
 
         if (modifier_has_rctrl && key_is_rshift) || (modifier_has_rshift && key_is_rctrl) {
             return HotkeyModeConfig::Known(HotkeyMode::RightCtrlRightShiftHold);

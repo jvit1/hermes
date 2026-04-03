@@ -2,6 +2,10 @@
 name = "hermes"
 version = "0.1.0"
 edition = "2021"
+description = "Windows-first push-to-talk speech-to-text app built around local whisper.cpp inference"
+license = "MIT"
+readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1.0"

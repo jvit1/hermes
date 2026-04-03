@@ -5,6 +5,7 @@ mod input;
 mod output;
 mod platform;
 mod stt;
+mod tooling;
 
 use std::path::Path;
 

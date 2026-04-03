@@ -1,20 +1,16 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use tracing::warn;
+use tracing::info;
 
-use crate::config::{AppConfig, BackendPreference};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendUsed {
-    Gpu,
-    Cpu,
-}
+use crate::config::AppConfig;
+use crate::tooling::write_embedded_tooling_script;
 
 #[derive(Debug, Clone)]
 pub struct DecodeOptions {
@@ -25,17 +21,16 @@ pub struct DecodeOptions {
 pub struct Transcript {
     pub text: String,
     pub latency_ms: u128,
-    pub backend_used: BackendUsed,
 }
 
 pub trait Transcriber {
     fn transcribe(&self, pcm_mono_16khz: &[f32], options: &DecodeOptions) -> Result<Transcript>;
 }
 
+#[derive(Clone)]
 pub struct WhisperCliTranscriber {
     whisper_cli_path: PathBuf,
     model_path: PathBuf,
-    backend_preference: BackendPreference,
     scratch_dir: PathBuf,
 }
 
@@ -50,36 +45,8 @@ impl WhisperCliTranscriber {
         Ok(Self {
             whisper_cli_path,
             model_path: config.model_path.clone(),
-            backend_preference: config.backend,
             scratch_dir,
         })
-    }
-
-    pub fn probe_backend(&self) -> Result<BackendUsed> {
-        let output = Command::new(&self.whisper_cli_path)
-            .arg("--help")
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to run whisper CLI for backend probe: {}",
-                    self.whisper_cli_path.display()
-                )
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let hint = whisper_cli_status_hint(output.status.code())
-                .map(|h| format!("\n{h}"))
-                .unwrap_or_default();
-            bail!(
-                "whisper CLI backend probe failed (status: {}):\nstdout: {}\nstderr: {}{}",
-                output.status,
-                stdout,
-                stderr,
-                hint
-            );
-        }
-        Ok(BackendUsed::Gpu)
     }
 }
 
@@ -89,13 +56,10 @@ impl Transcriber for WhisperCliTranscriber {
             return Ok(Transcript {
                 text: String::new(),
                 latency_ms: 0,
-                backend_used: BackendUsed::Cpu,
             });
         }
 
-        if !self.model_path.exists() {
-            bail!("Whisper model not found at {}", self.model_path.display());
-        }
+        ensure_model_file(&self.model_path)?;
 
         let started = Instant::now();
         let nonce = rand_seed();
@@ -103,33 +67,13 @@ impl Transcriber for WhisperCliTranscriber {
         let out_prefix = self.scratch_dir.join(format!("ptt-{nonce}-transcript"));
         write_wav_f32_16khz(&wav_path, pcm_mono_16khz)?;
 
-        let mut last_error: Option<anyhow::Error> = None;
-        let run_order: Vec<bool> = match self.backend_preference {
-            BackendPreference::GpuThenCpu => vec![false, true],
-            BackendPreference::CpuOnly => vec![true],
-        };
-
-        for force_cpu in run_order {
-            match self.run_whisper(&wav_path, &out_prefix, options, force_cpu) {
-                Ok((text, backend_used)) => {
-                    cleanup_temp_files(&wav_path, &out_prefix);
-                    return Ok(Transcript {
-                        text: normalize_transcript(&text),
-                        latency_ms: started.elapsed().as_millis(),
-                        backend_used,
-                    });
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    if !force_cpu {
-                        warn!("GPU transcription failed; attempting CPU fallback");
-                    }
-                }
-            }
-        }
-
+        let result = self.run_whisper(&wav_path, &out_prefix, options);
         cleanup_temp_files(&wav_path, &out_prefix);
-        Err(last_error.unwrap_or_else(|| anyhow!("unknown transcription error")))
+        let text = result?;
+        Ok(Transcript {
+            text: normalize_transcript(&text),
+            latency_ms: started.elapsed().as_millis(),
+        })
     }
 }
 
@@ -139,8 +83,7 @@ impl WhisperCliTranscriber {
         wav_path: &Path,
         out_prefix: &Path,
         options: &DecodeOptions,
-        force_cpu: bool,
-    ) -> Result<(String, BackendUsed)> {
+    ) -> Result<String> {
         let mut cmd = Command::new(&self.whisper_cli_path);
         cmd.arg("-m")
             .arg(&self.model_path)
@@ -151,12 +94,8 @@ impl WhisperCliTranscriber {
             .arg("-otxt")
             .arg("-nt")
             .arg("-of")
-            .arg(out_prefix);
-
-        if force_cpu {
-            // Newer whisper-cli builds use -ng/--no-gpu for CPU mode.
-            cmd.arg("-ng");
-        }
+            .arg(out_prefix)
+            .arg("-ng");
 
         let output = cmd.output().with_context(|| {
             format!(
@@ -198,8 +137,7 @@ impl WhisperCliTranscriber {
                 txt_path.display()
             )
         })?;
-        let backend = detect_backend_used(&output.stdout, &output.stderr, force_cpu);
-        Ok((text, backend))
+        Ok(text)
     }
 }
 
@@ -210,23 +148,14 @@ fn write_wav_f32_16khz(path: &Path, pcm: &[f32]) -> Result<()> {
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut writer =
-        WavWriter::create(path, spec).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = WavWriter::create(path, spec)
+        .with_context(|| format!("failed to create {}", path.display()))?;
     for sample in pcm {
         let clamped = sample.clamp(-1.0, 1.0);
         writer.write_sample((clamped * i16::MAX as f32) as i16)?;
     }
     writer.finalize()?;
     Ok(())
-}
-
-fn detect_backend_used(stdout: &[u8], stderr: &[u8], force_cpu: bool) -> BackendUsed {
-    if force_cpu {
-        return BackendUsed::Cpu;
-    }
-
-    let _ = (stdout, stderr);
-    BackendUsed::Gpu
 }
 
 fn cleanup_temp_files(wav_path: &Path, out_prefix: &Path) {
@@ -294,7 +223,83 @@ fn whisper_cli_status_hint(code: Option<i32>) -> Option<&'static str> {
     None
 }
 
+fn ensure_model_file(model_path: &Path) -> Result<()> {
+    if model_path.exists() {
+        return Ok(());
+    }
+
+    let Some(variant) = known_model_variant(model_path) else {
+        bail!("Whisper model not found at {}", model_path.display());
+    };
+
+    println!(
+        "[model] {} is missing, attempting automatic download",
+        model_path.display()
+    );
+    let _ = io::stdout().flush();
+
+    match try_bootstrap_model(model_path, variant) {
+        Ok(()) => {
+            if !model_path.exists() {
+                bail!(
+                    "automatic model download completed, but the model is still missing at {}",
+                    model_path.display()
+                );
+            }
+            println!("[model] {} ready", variant);
+            let _ = io::stdout().flush();
+            Ok(())
+        }
+        Err(error) => {
+            bail!(
+                "Whisper model not found at {}\nautomatic model download failed: {error:#}\nmanual fix: install Python 3 so `py` or `python` is on PATH and re-run Hermes, or download the `{variant}` model from Settings.",
+                model_path.display()
+            );
+        }
+    }
+}
+
 fn ensure_runtime_files(whisper_cli_path: &Path) -> Result<()> {
+    if validate_runtime_files(whisper_cli_path).is_ok() {
+        return Ok(());
+    }
+
+    let runtime_dir = runtime_dir(whisper_cli_path)?;
+    println!(
+        "[runtime] whisper runtime missing, attempting automatic download into {}",
+        runtime_dir.display()
+    );
+    let _ = io::stdout().flush();
+
+    match try_bootstrap_runtime(whisper_cli_path) {
+        Ok(()) => {
+            validate_runtime_files(whisper_cli_path).with_context(|| {
+                format!(
+                    "automatic runtime download completed, but the runtime is still incomplete in {}",
+                    runtime_dir.display()
+                )
+            })?;
+            info!("whisper runtime ready at {}", runtime_dir.display());
+            println!("[runtime] whisper runtime ready");
+            let _ = io::stdout().flush();
+            Ok(())
+        }
+        Err(bootstrap_error) => {
+            let manual_hint = format!(
+                "manual fix: install Python 3 so `py` or `python` is on PATH and re-run Hermes, or manually place whisper-cli.exe with whisper.dll, ggml.dll, ggml-base.dll, and ggml-cpu.dll in {}",
+                runtime_dir.display()
+            );
+            let initial_error = validate_runtime_files(whisper_cli_path)
+                .err()
+                .unwrap_or_else(|| anyhow!("whisper runtime validation failed"));
+            bail!(
+                "{initial_error:#}\nautomatic runtime download failed: {bootstrap_error:#}\n{manual_hint}"
+            );
+        }
+    }
+}
+
+fn validate_runtime_files(whisper_cli_path: &Path) -> Result<()> {
     if !whisper_cli_path.exists() {
         bail!(
             "whisper-cli executable not found at {}",
@@ -302,16 +307,8 @@ fn ensure_runtime_files(whisper_cli_path: &Path) -> Result<()> {
         );
     }
 
-    let Some(runtime_dir) = whisper_cli_path.parent() else {
-        bail!("whisper-cli path has no parent directory");
-    };
-
-    let required = ["whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"];
-    let missing = required
-        .iter()
-        .filter(|name| !runtime_dir.join(name).exists())
-        .copied()
-        .collect::<Vec<_>>();
+    let runtime_dir = runtime_dir(whisper_cli_path)?;
+    let missing = missing_runtime_files(runtime_dir);
 
     if !missing.is_empty() {
         bail!(
@@ -322,4 +319,140 @@ fn ensure_runtime_files(whisper_cli_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn try_bootstrap_runtime(whisper_cli_path: &Path) -> Result<()> {
+    let runtime_dir = runtime_dir(whisper_cli_path)?;
+    fs::create_dir_all(runtime_dir)?;
+
+    let script_path = write_embedded_tooling_script("runtime")
+        .context("failed to prepare embedded Python runtime bootstrap helper")?;
+    let result = (|| {
+        let asset_name = preferred_runtime_asset_name();
+        let mut attempts = Vec::new();
+
+        for (program, prefix_args) in python_launchers() {
+            let mut cmd = Command::new(program);
+            cmd.args(prefix_args)
+                .arg(&script_path)
+                .arg("ensure-runtime")
+                .arg("--runtime-dir")
+                .arg(runtime_dir)
+                .arg("--asset-name")
+                .arg(asset_name);
+
+            match cmd.status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => attempts.push(format!(
+                    "{} {} exited with status {}",
+                    program,
+                    prefix_args.join(" "),
+                    status
+                )),
+                Err(error) => attempts.push(format!(
+                    "{} {} failed to start: {}",
+                    program,
+                    prefix_args.join(" "),
+                    error
+                )),
+            }
+        }
+
+        bail!(
+            "failed to invoke Python runtime bootstrap helper at {}:\n{}",
+            script_path.display(),
+            attempts.join("\n")
+        );
+    })();
+    let _ = fs::remove_file(&script_path);
+    result
+}
+
+fn try_bootstrap_model(model_path: &Path, variant: &str) -> Result<()> {
+    if let Some(parent) = model_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let script_path = write_embedded_tooling_script("model")
+        .context("failed to prepare embedded Python model bootstrap helper")?;
+    let result = (|| {
+        let mut attempts = Vec::new();
+
+        for (program, prefix_args) in python_launchers() {
+            let mut cmd = Command::new(program);
+            cmd.args(prefix_args)
+                .arg(&script_path)
+                .arg("download-model")
+                .arg("--variant")
+                .arg(variant)
+                .arg("--output")
+                .arg(model_path);
+
+            match cmd.status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => attempts.push(format!(
+                    "{} {} exited with status {}",
+                    program,
+                    prefix_args.join(" "),
+                    status
+                )),
+                Err(error) => attempts.push(format!(
+                    "{} {} failed to start: {}",
+                    program,
+                    prefix_args.join(" "),
+                    error
+                )),
+            }
+        }
+
+        bail!(
+            "failed to invoke Python model bootstrap helper at {}:\n{}",
+            script_path.display(),
+            attempts.join("\n")
+        );
+    })();
+    let _ = fs::remove_file(&script_path);
+    result
+}
+
+fn runtime_dir(whisper_cli_path: &Path) -> Result<&Path> {
+    whisper_cli_path
+        .parent()
+        .context("whisper-cli path has no parent directory")
+}
+
+fn missing_runtime_files(runtime_dir: &Path) -> Vec<&'static str> {
+    ["whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"]
+        .into_iter()
+        .filter(|name| !runtime_dir.join(name).exists())
+        .collect()
+}
+
+fn known_model_variant(model_path: &Path) -> Option<&'static str> {
+    let filename = model_path
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    match filename.as_str() {
+        "ggml-tiny.en.bin" => Some("tiny.en"),
+        "ggml-base.en.bin" => Some("base.en"),
+        "ggml-small.en.bin" => Some("small.en"),
+        "ggml-medium.en.bin" => Some("medium.en"),
+        "ggml-large-v3.bin" => Some("large-v3"),
+        _ => None,
+    }
+}
+
+fn python_launchers() -> [(&'static str, &'static [&'static str]); 2] {
+    [("py", &["-3"]), ("python", &[])]
+}
+
+#[cfg(target_arch = "x86")]
+fn preferred_runtime_asset_name() -> &'static str {
+    "whisper-bin-Win32.zip"
+}
+
+#[cfg(not(target_arch = "x86"))]
+fn preferred_runtime_asset_name() -> &'static str {
+    "whisper-bin-x64.zip"
 }

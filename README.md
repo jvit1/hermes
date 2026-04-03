@@ -10,7 +10,7 @@ Windows-first push-to-talk speech-to-text app in Rust, using local `whisper.cpp`
 - Release to transcribe
 - Print the transcript to the console
 - Optionally paste/type the transcript into the focused app
-- Prefer GPU inference and fall back to CPU when configured
+- Run `whisper-cli` in CPU-only mode for simpler, predictable behavior
 
 Current default behavior:
 
@@ -25,7 +25,7 @@ Current default behavior:
 - `src/audio/capture.rs`: microphone capture and resampling
 - `src/input/hotkey.rs`: global hotkey listener
 - `src/output/typing.rs`: clipboard paste and Unicode typing fallback
-- `src/stt/engine.rs`: `whisper-cli` invocation and backend fallback
+- `src/stt/engine.rs`: `whisper-cli` invocation and runtime/model bootstrap
 - `src/platform/windows/settings_dialog.rs`: PowerShell-backed settings dialog
 - `scripts/ptt_tooling.py`: build, diagnostics, packaging, startup helpers, model download
 - `whisper-runtime/`: expected location for `whisper-cli.exe` and required DLLs
@@ -84,6 +84,15 @@ whisper-runtime\
 
 The app expects the runtime DLLs to live next to `whisper-cli.exe`.
 
+If the runtime is missing, Hermes now tries to download the official Windows
+`whisper.cpp` release asset automatically by calling:
+
+```powershell
+python .\scripts\ptt_tooling.py ensure-runtime --runtime-dir .\target\release\whisper-runtime
+```
+
+You can also run that command yourself ahead of time.
+
 ### 3. Download a model
 
 Download the default model:
@@ -131,10 +140,9 @@ Diagnostics print:
 - model path
 - `whisper-cli` path
 - hotkey configuration
-- backend preference
+- inference mode
 - language
 - microphone availability
-- backend probe result
 
 ### 6. Launch the app
 
@@ -143,6 +151,9 @@ Foreground mode:
 ```powershell
 cargo run --release
 ```
+
+If `whisper-cli.exe` is missing next to the built executable, the app will try
+to bootstrap `target\release\whisper-runtime\` automatically on startup.
 
 Background mode with hidden console:
 
@@ -164,10 +175,8 @@ Current settings:
 
 - `hotkey.modifier`
 - `hotkey.key`
-- `backend`
 - `model_path`
 - `whisper_cli_path`
-- `gpu_layers`
 - `min_record_ms`
 - `auto_punctuation`
 - `type_output`
@@ -181,6 +190,10 @@ You can edit settings by:
 - opening the tray menu and choosing `Settings`
 - launching the settings dialog with `--settings`
 
+The Settings dialog uses a model dropdown for standard Whisper variants and
+stores the corresponding `model_path` internally. If the selected standard
+model is missing, Hermes can download it automatically.
+
 The settings dialog can also download model files through Python if `py` or `python` is available on `PATH`.
 
 Supported hotkey modes in the current implementation:
@@ -193,10 +206,8 @@ Unsupported hotkey combinations currently fall back to `F8`.
 Example config:
 
 ```toml
-backend = "gpu_then_cpu"
 model_path = "C:\\Users\\<you>\\AppData\\Local\\Hermes\\Hermes\\data\\models\\ggml-medium.en.bin"
 whisper_cli_path = "whisper-runtime\\whisper-cli.exe"
-gpu_layers = 999
 min_record_ms = 200
 auto_punctuation = true
 type_output = true
@@ -253,6 +264,12 @@ Verify runtime and model:
 python .\scripts\ptt_tooling.py verify-runtime
 ```
 
+Download the official whisper.cpp Windows runtime:
+
+```powershell
+python .\scripts\ptt_tooling.py ensure-runtime --runtime-dir .\target\release\whisper-runtime
+```
+
 Download a model:
 
 ```powershell
@@ -294,16 +311,16 @@ The packaging flow copies:
 - startup helper scripts
 - an optional bundled model
 
-Example packaged output exists in `dist/smoke-package/`.
+Packaged output is written under `dist/` when you run the packaging command.
 
 Packaged installs resolve relative runtime paths from the directory containing `hermes.exe`, so the default `whisper_cli_path` works when `whisper-runtime\whisper-cli.exe` is shipped next to the app binary.
 
 ## Notes
 
 - This project shells out to `whisper-cli.exe`; it does not link directly to `whisper.cpp`.
+- Hermes always invokes `whisper-cli` with `-ng`, so inference runs in CPU-only mode.
 - The app writes rolling logs under the local app-data directory.
 - Settings are saved immediately, but some changes require restarting the app.
-- If GPU inference fails, the transcriber retries on CPU when `backend = "gpu_then_cpu"`.
 - The current codebase is Windows-only.
 
 ## Troubleshooting

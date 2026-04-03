@@ -3,16 +3,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub hotkey: HotkeyConfig,
-    pub backend: BackendPreference,
     pub model_path: PathBuf,
     pub whisper_cli_path: PathBuf,
-    pub gpu_layers: u32,
     pub min_record_ms: u64,
     pub auto_punctuation: bool,
     pub type_output: bool,
@@ -23,32 +21,6 @@ pub struct AppConfig {
 pub struct HotkeyConfig {
     pub modifier: String,
     pub key: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub enum BackendPreference {
-    GpuThenCpu,
-    CpuOnly,
-}
-
-impl<'de> Deserialize<'de> for BackendPreference {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        let normalized = value.trim().to_ascii_lowercase();
-
-        if normalized == "gpu_then_cpu" || normalized == legacy_gpu_then_cpu_name() {
-            Ok(Self::GpuThenCpu)
-        } else if normalized == "cpu_only" {
-            Ok(Self::CpuOnly)
-        } else {
-            Err(D::Error::custom(format!(
-                "unsupported backend preference: {value}"
-            )))
-        }
-    }
 }
 
 impl Default for AppConfig {
@@ -62,10 +34,8 @@ impl Default for AppConfig {
                 modifier: "none".to_string(),
                 key: "f8".to_string(),
             },
-            backend: BackendPreference::GpuThenCpu,
             model_path,
             whisper_cli_path: default_whisper_cli_path(),
-            gpu_layers: 999,
             min_record_ms: 200,
             auto_punctuation: true,
             type_output: true,
@@ -78,15 +48,14 @@ impl AppConfig {
     pub fn load_or_create_default() -> Result<Self> {
         let config_path = Self::config_path();
         if config_path.exists() {
-            let content = fs::read_to_string(&config_path)
-                .with_context(|| format!("failed to read config file at {}", config_path.display()))?;
-            let mut cfg: Self =
-                toml::from_str(&content).with_context(|| "failed to parse config TOML".to_string())?;
+            let content = fs::read_to_string(&config_path).with_context(|| {
+                format!("failed to read config file at {}", config_path.display())
+            })?;
+            let mut cfg: Self = toml::from_str(&content)
+                .with_context(|| "failed to parse config TOML".to_string())?;
             if cfg.migrate_whisper_cli_path() {
                 if let Err(err) = cfg.save() {
-                    eprintln!(
-                        "warning: failed to persist migrated whisper_cli_path: {err:#}"
-                    );
+                    eprintln!("warning: failed to persist migrated whisper_cli_path: {err:#}");
                 }
             }
             return Ok(cfg);
@@ -154,17 +123,12 @@ fn app_dirs() -> ProjectDirs {
         .expect("valid project directories must be available on Windows")
 }
 
-fn legacy_gpu_then_cpu_name() -> String {
-    ['v', 'u', 'l', 'k', 'a', 'n', '_', 't', 'h', 'e', 'n', '_', 'c', 'p', 'u']
-        .into_iter()
-        .collect()
-}
-
 fn whisper_cli_candidates() -> Vec<PathBuf> {
     vec![
         default_whisper_cli_path(),
         PathBuf::from("whisper-cli.exe"),
         absolute_packaged_whisper_cli_path(),
+        current_dir_whisper_cli_path(),
     ]
 }
 
@@ -200,6 +164,48 @@ fn absolute_packaged_whisper_cli_path() -> PathBuf {
         .unwrap_or_else(default_whisper_cli_path)
 }
 
+fn current_dir_whisper_cli_path() -> PathBuf {
+    std::env::current_dir()
+        .map(|dir| dir.join(default_whisper_cli_path()))
+        .unwrap_or_else(|_| default_whisper_cli_path())
+}
+
 fn is_legacy_default_whisper_cli_path(path: &Path) -> bool {
     path == Path::new("whisper-cli.exe")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn app_config_ignores_removed_gpu_fields() {
+        let config = toml::from_str::<AppConfig>(
+            r#"
+backend = "gpu_then_cpu"
+model_path = "C:\\models\\ggml-medium.en.bin"
+whisper_cli_path = "whisper-runtime\\whisper-cli.exe"
+gpu_layers = 999
+min_record_ms = 200
+auto_punctuation = true
+type_output = true
+language = "en"
+
+[hotkey]
+modifier = "none"
+key = "f8"
+"#,
+        )
+        .expect("legacy config should parse");
+
+        assert_eq!(config.language, "en");
+        assert_eq!(config.min_record_ms, 200);
+    }
+
+    #[test]
+    fn default_config_omits_removed_gpu_fields() {
+        let toml = toml::to_string(&AppConfig::default()).expect("default config should serialize");
+        assert!(!toml.contains("backend"));
+        assert!(!toml.contains("gpu_layers"));
+    }
 }

@@ -7,8 +7,8 @@ use clipboard_win::{formats, set_clipboard};
 use tracing::warn;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
-    VK_RWIN, VK_SHIFT, VK_LWIN, VIRTUAL_KEY,
+    VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 
 pub struct TextTyper;
@@ -121,7 +121,11 @@ fn virtual_key_input(vk: VIRTUAL_KEY, keyup: bool) -> INPUT {
             ki: KEYBDINPUT {
                 wVk: vk,
                 wScan: 0,
-                dwFlags: if keyup { KEYEVENTF_KEYUP } else { Default::default() },
+                dwFlags: if keyup {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
                 time: 0,
                 dwExtraInfo: 0,
             },

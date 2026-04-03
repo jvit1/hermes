@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +30,15 @@ MODEL_VARIANTS = {
     "small.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
     "medium.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
     "large-v3": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+}
+WHISPER_RELEASES_API = "https://api.github.com/repos/ggml-org/whisper.cpp/releases"
+RUNTIME_ARCHIVE_BY_MACHINE = {
+    "amd64": "whisper-bin-x64.zip",
+    "x86_64": "whisper-bin-x64.zip",
+    "x64": "whisper-bin-x64.zip",
+    "i386": "whisper-bin-Win32.zip",
+    "i686": "whisper-bin-Win32.zip",
+    "x86": "whisper-bin-Win32.zip",
 }
 
 
@@ -61,6 +73,34 @@ def _default_startup_shortcut() -> Path:
         / "Startup"
         / "Hermes.lnk"
     )
+
+
+def _default_runtime_asset_name() -> str:
+    machine = platform.machine().lower()
+    return RUNTIME_ARCHIVE_BY_MACHINE.get(machine, "whisper-bin-x64.zip")
+
+
+def _optional_requests():
+    try:
+        import requests
+    except ImportError:
+        return None
+    return requests
+
+
+def _read_json(url: str, headers: dict[str, str] | None = None) -> object:
+    try:
+        requests = _optional_requests()
+        if requests is not None:
+            response = requests.get(url, headers=headers, timeout=60)
+            response.raise_for_status()
+            return response.json()
+
+        request = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        raise ToolingError(f"Failed to fetch JSON from {url}: {error}") from error
 
 
 def _run_command(command: list[str], cwd: Path | None = None) -> None:
@@ -98,7 +138,8 @@ def _assert_runtime_dir(runtime_dir: Path) -> None:
         missing_text = ", ".join(missing)
         raise ToolingError(
             f"Missing runtime files in {runtime_dir}: {missing_text}. "
-            "Expected whisper runtime DLLs next to whisper-cli.exe."
+            "Expected whisper runtime DLLs next to whisper-cli.exe. "
+            "Use `ensure-runtime` to fetch the official whisper.cpp Windows runtime."
         )
 
 
@@ -126,29 +167,131 @@ def cmd_verify_runtime(args: argparse.Namespace) -> None:
         print("Use `download-model` to fetch one.")
 
 
-def _download_with_progress(url: str, destination: Path) -> None:
+def _download_with_progress(
+    url: str, destination: Path, headers: dict[str, str] | None = None
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as response:
-        total_bytes = int(response.headers.get("Content-Length", "0"))
-        with tempfile.NamedTemporaryFile(
-            mode="wb", delete=False, dir=destination.parent
-        ) as tmp_file:
-            downloaded = 0
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                tmp_file.write(chunk)
-                downloaded += len(chunk)
-                if total_bytes > 0:
-                    percent = downloaded * 100 / total_bytes
-                    print(f"\rDownloaded {downloaded:,} / {total_bytes:,} bytes ({percent:0.1f}%)", end="")
-                else:
-                    print(f"\rDownloaded {downloaded:,} bytes", end="")
-            temp_path = Path(tmp_file.name)
+    temp_path: Path | None = None
+    try:
+        requests = _optional_requests()
+        if requests is not None:
+            with requests.get(url, stream=True, headers=headers, timeout=60) as response:
+                response.raise_for_status()
+                total_bytes = int(response.headers.get("Content-Length", "0"))
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", delete=False, dir=destination.parent
+                ) as tmp_file:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        tmp_file.write(chunk)
+                        downloaded += len(chunk)
+                        _print_download_progress(downloaded, total_bytes)
+                    temp_path = Path(tmp_file.name)
+        else:
+            request = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                total_bytes = int(response.headers.get("Content-Length", "0"))
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", delete=False, dir=destination.parent
+                ) as tmp_file:
+                    downloaded = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        tmp_file.write(chunk)
+                        downloaded += len(chunk)
+                        _print_download_progress(downloaded, total_bytes)
+                    temp_path = Path(tmp_file.name)
+    except Exception as error:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise ToolingError(f"Failed to download {url}: {error}") from error
 
     print()
+    if temp_path is None:
+        raise ToolingError(f"Download did not produce a file for {url}.")
     temp_path.replace(destination)
+
+
+def _print_download_progress(downloaded: int, total_bytes: int) -> None:
+    if total_bytes > 0:
+        percent = downloaded * 100 / total_bytes
+        print(
+            f"\rDownloaded {downloaded:,} / {total_bytes:,} bytes ({percent:0.1f}%)",
+            end="",
+        )
+    else:
+        print(f"\rDownloaded {downloaded:,} bytes", end="")
+
+
+def _fetch_whisper_release(tag: str | None) -> dict[str, object]:
+    if tag:
+        url = f"{WHISPER_RELEASES_API}/tags/{tag}"
+    else:
+        url = f"{WHISPER_RELEASES_API}/latest"
+
+    payload = _read_json(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Hermes Runtime Bootstrap",
+        },
+    )
+    if not isinstance(payload, dict):
+        raise ToolingError(f"Unexpected GitHub API response from {url}.")
+    return payload
+
+
+def _select_runtime_asset(
+    release: dict[str, object], asset_name: str
+) -> dict[str, object]:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise ToolingError("GitHub release response did not include an asset list.")
+
+    for asset in assets:
+        if isinstance(asset, dict) and asset.get("name") == asset_name:
+            return asset
+
+    available_assets = []
+    for asset in assets:
+        if isinstance(asset, dict):
+            name = asset.get("name")
+            if isinstance(name, str):
+                available_assets.append(name)
+
+    tag_name = release.get("tag_name", "unknown")
+    available_text = ", ".join(sorted(available_assets)) or "(none)"
+    raise ToolingError(
+        f"Release {tag_name} does not contain asset {asset_name}. "
+        f"Available assets: {available_text}"
+    )
+
+
+def _locate_runtime_payload_dir(root: Path) -> Path:
+    matches = []
+    for whisper_cli in root.rglob("whisper-cli.exe"):
+        candidate = whisper_cli.parent
+        if all((candidate / name).exists() for name in REQUIRED_RUNTIME_FILES[1:]):
+            matches.append(candidate)
+
+    if not matches:
+        raise ToolingError(
+            f"Downloaded archive did not contain a complete whisper runtime under {root}."
+        )
+
+    matches.sort(key=lambda path: (len(path.parts), str(path).lower()))
+    return matches[0]
+
+
+def _copy_runtime_payload(source_dir: Path, runtime_dir: Path) -> None:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    for source in source_dir.iterdir():
+        if source.is_file():
+            shutil.copy2(source, runtime_dir / source.name)
 
 
 def cmd_download_model(args: argparse.Namespace) -> None:
@@ -169,6 +312,52 @@ def cmd_download_model(args: argparse.Namespace) -> None:
     print(f"Downloading model from: {url}")
     _download_with_progress(url, output_path)
     print(f"Model saved to: {output_path}")
+
+
+def cmd_ensure_runtime(args: argparse.Namespace) -> None:
+    runtime_dir = _repo_path(args.runtime_dir)
+    asset_name = args.asset_name or _default_runtime_asset_name()
+
+    if not args.force:
+        try:
+            _assert_runtime_dir(runtime_dir)
+            print(f"Runtime already available: {runtime_dir}")
+            return
+        except ToolingError:
+            pass
+
+    release = _fetch_whisper_release(args.tag)
+    asset = _select_runtime_asset(release, asset_name)
+    tag_name = release.get("tag_name", args.tag or "latest")
+    download_url = asset.get("browser_download_url")
+    if not isinstance(download_url, str) or not download_url:
+        raise ToolingError(
+            f"Release {tag_name} asset {asset_name} does not include a download URL."
+        )
+
+    print(f"Downloading whisper runtime from release {tag_name}: {asset_name}")
+    with tempfile.TemporaryDirectory(prefix="hermes-whisper-runtime-") as temp_dir_text:
+        temp_dir = Path(temp_dir_text)
+        archive_path = temp_dir / asset_name
+        extract_dir = temp_dir / "extract"
+
+        _download_with_progress(
+            download_url,
+            archive_path,
+            headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "Hermes Runtime Bootstrap",
+            },
+        )
+
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(extract_dir)
+
+        payload_dir = _locate_runtime_payload_dir(extract_dir)
+        _copy_runtime_payload(payload_dir, runtime_dir)
+
+    _assert_runtime_dir(runtime_dir)
+    print(f"Runtime saved to: {runtime_dir}")
 
 
 def cmd_install_startup(args: argparse.Namespace) -> None:
@@ -309,6 +498,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser_download.add_argument("--force", action="store_true", help="Overwrite existing model file.")
     parser_download.set_defaults(func=cmd_download_model)
+
+    parser_runtime = subparsers.add_parser(
+        "ensure-runtime",
+        help="Download and extract the whisper.cpp Windows runtime when it is missing.",
+    )
+    parser_runtime.add_argument(
+        "--runtime-dir",
+        default="whisper-runtime",
+        help="Directory where whisper-cli.exe and runtime DLLs should be placed.",
+    )
+    parser_runtime.add_argument(
+        "--tag",
+        help="Specific whisper.cpp release tag to download (defaults to the latest release).",
+    )
+    parser_runtime.add_argument(
+        "--asset-name",
+        help="Specific release asset name to download (defaults to whisper-bin-x64.zip on 64-bit Windows).",
+    )
+    parser_runtime.add_argument(
+        "--force",
+        action="store_true",
+        help="Redownload the runtime even if the required files already exist.",
+    )
+    parser_runtime.set_defaults(func=cmd_ensure_runtime)
 
     parser_install = subparsers.add_parser("install-startup", help="Create a Startup shortcut for the executable.")
     parser_install.add_argument(

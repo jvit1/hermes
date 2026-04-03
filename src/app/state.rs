@@ -14,7 +14,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        Self { phase: AppPhase::Idle }
+        Self {
+            phase: AppPhase::Idle,
+        }
     }
 
     pub fn phase(&self) -> AppPhase {

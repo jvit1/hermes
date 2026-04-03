@@ -3,3 +3,7 @@
 models/
 .idea/
 .vscode/
+dist/
+whisper-runtime/
+scripts/__pycache__/
+*.pyc

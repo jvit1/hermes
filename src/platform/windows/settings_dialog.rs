@@ -3,13 +3,14 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{current_exe_dir, AppConfig, BackendPreference};
+use crate::config::AppConfig;
+use crate::tooling::write_embedded_tooling_script;
 
 const SETTINGS_DIALOG_SCRIPT: &str = include_str!("../../../assets/settings-dialog.ps1");
 
 pub fn open_settings_dialog(config: &AppConfig) -> Result<Option<AppConfig>> {
     let script_path = std::env::temp_dir().join("hermes-settings-dialog.ps1");
-    let app_root = current_exe_dir().context("failed to resolve executable directory")?;
+    let tooling_script_path = write_embedded_tooling_script("settings")?;
     fs::write(&script_path, SETTINGS_DIALOG_SCRIPT).with_context(|| {
         format!(
             "failed to write settings dialog script to {}",
@@ -17,36 +18,37 @@ pub fn open_settings_dialog(config: &AppConfig) -> Result<Option<AppConfig>> {
         )
     })?;
 
-    let output = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
-        .arg("-RepoRoot")
-        .arg(app_root.to_string_lossy().to_string())
-        .arg("-ModelPath")
-        .arg(config.model_path.to_string_lossy().to_string())
-        .arg("-WhisperCliPath")
-        .arg(config.whisper_cli_path.to_string_lossy().to_string())
-        .arg("-Backend")
-        .arg(backend_to_config_value(config.backend))
-        .arg("-Language")
-        .arg(&config.language)
-        .arg("-HotkeyModifier")
-        .arg(&config.hotkey.modifier)
-        .arg("-HotkeyKey")
-        .arg(&config.hotkey.key)
-        .arg("-MinRecordMs")
-        .arg(config.min_record_ms.to_string())
-        .arg("-GpuLayers")
-        .arg(config.gpu_layers.to_string())
-        .arg("-AutoPunctuation")
-        .arg(config.auto_punctuation.to_string())
-        .arg("-TypeOutput")
-        .arg(config.type_output.to_string())
-        .output()
-        .context("failed to launch settings dialog via PowerShell")?;
+    let output = (|| {
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .arg("-ToolingScriptPath")
+            .arg(tooling_script_path.to_string_lossy().to_string())
+            .arg("-ModelPath")
+            .arg(config.model_path.to_string_lossy().to_string())
+            .arg("-WhisperCliPath")
+            .arg(config.whisper_cli_path.to_string_lossy().to_string())
+            .arg("-Language")
+            .arg(&config.language)
+            .arg("-HotkeyModifier")
+            .arg(&config.hotkey.modifier)
+            .arg("-HotkeyKey")
+            .arg(&config.hotkey.key)
+            .arg("-MinRecordMs")
+            .arg(config.min_record_ms.to_string())
+            .arg("-AutoPunctuation")
+            .arg(config.auto_punctuation.to_string())
+            .arg("-TypeOutput")
+            .arg(config.type_output.to_string())
+            .output()
+            .context("failed to launch settings dialog via PowerShell")
+    })();
+    let _ = fs::remove_file(&tooling_script_path);
+    let _ = fs::remove_file(&script_path);
+    let output = output?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -66,14 +68,7 @@ pub fn open_settings_dialog(config: &AppConfig) -> Result<Option<AppConfig>> {
         return Ok(None);
     }
 
-    let updated = toml::from_str::<AppConfig>(trimmed)
-        .context("settings dialog returned invalid TOML")?;
+    let updated =
+        toml::from_str::<AppConfig>(trimmed).context("settings dialog returned invalid TOML")?;
     Ok(Some(updated))
-}
-
-fn backend_to_config_value(backend: BackendPreference) -> &'static str {
-    match backend {
-        BackendPreference::GpuThenCpu => "gpu_then_cpu",
-        BackendPreference::CpuOnly => "cpu_only",
-    }
 }

@@ -7,7 +7,7 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CapturedAudio {
     pub pcm_16khz_mono: Vec<f32>,
     pub duration_ms: u64,
@@ -48,7 +48,9 @@ impl AudioCapture {
         let channels = stream_cfg.channels as usize;
         let sample_rate = stream_cfg.sample_rate.0;
 
-        let raw_mono = Arc::new(Mutex::new(Vec::<f32>::with_capacity(sample_rate as usize * 20)));
+        let raw_mono = Arc::new(Mutex::new(Vec::<f32>::with_capacity(
+            sample_rate as usize * 20,
+        )));
         let buffer_ref = Arc::clone(&raw_mono);
         let err_fn = |err| eprintln!("audio stream error: {err}");
 
@@ -85,28 +87,44 @@ impl AudioCapture {
 }
 
 impl AudioCaptureSession {
+    pub fn snapshot(&self) -> Result<CapturedAudio> {
+        self.capture_current_audio()
+    }
+
     pub fn finish(self) -> Result<CapturedAudio> {
-        self.stream.pause().ok();
-        drop(self.stream);
+        let AudioCaptureSession {
+            stream,
+            raw_mono,
+            input_sample_rate,
+            started_at,
+        } = self;
 
-        let duration_ms = self.started_at.elapsed().as_millis() as u64;
-        let raw_mono = self
-            .raw_mono
-            .lock()
-            .map_err(|_| anyhow!("failed to lock audio buffer"))?
-            .clone();
+        stream.pause().ok();
+        drop(stream);
 
-        let pcm_16khz_mono = if self.input_sample_rate == TARGET_SAMPLE_RATE {
-            raw_mono
-        } else {
-            resample_linear(&raw_mono, self.input_sample_rate, TARGET_SAMPLE_RATE)
-                .context("failed to resample audio to 16kHz")?
-        };
+        capture_current_audio(&raw_mono, input_sample_rate, started_at)
+    }
 
-        Ok(CapturedAudio {
+    fn capture_current_audio(&self) -> Result<CapturedAudio> {
+        capture_current_audio(&self.raw_mono, self.input_sample_rate, self.started_at)
+    }
+}
+
+impl CapturedAudio {
+    pub fn tail_ms(&self, max_duration_ms: u64) -> Self {
+        if max_duration_ms == 0 || self.duration_ms <= max_duration_ms {
+            return self.clone();
+        }
+
+        let target_samples = ((TARGET_SAMPLE_RATE as u64 * max_duration_ms) / 1000).max(1) as usize;
+        let start = self.pcm_16khz_mono.len().saturating_sub(target_samples);
+        let pcm_16khz_mono = self.pcm_16khz_mono[start..].to_vec();
+        let duration_ms = ((pcm_16khz_mono.len() as u64) * 1000 / TARGET_SAMPLE_RATE as u64).max(1);
+
+        Self {
             pcm_16khz_mono,
             duration_ms,
-        })
+        }
     }
 }
 
@@ -119,10 +137,38 @@ fn append_frames_f32(data: &[f32], channels: usize, buffer: &Arc<Mutex<Vec<f32>>
     }
 }
 
+fn capture_current_audio(
+    raw_mono: &Arc<Mutex<Vec<f32>>>,
+    input_sample_rate: u32,
+    started_at: Instant,
+) -> Result<CapturedAudio> {
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    let raw_mono = raw_mono
+        .lock()
+        .map_err(|_| anyhow!("failed to lock audio buffer"))?
+        .clone();
+
+    let pcm_16khz_mono = if input_sample_rate == TARGET_SAMPLE_RATE {
+        raw_mono
+    } else {
+        resample_linear(&raw_mono, input_sample_rate, TARGET_SAMPLE_RATE)
+            .context("failed to resample audio to 16kHz")?
+    };
+
+    Ok(CapturedAudio {
+        pcm_16khz_mono,
+        duration_ms,
+    })
+}
+
 fn append_frames_i16(data: &[i16], channels: usize, buffer: &Arc<Mutex<Vec<f32>>>) {
     if let Ok(mut output) = buffer.lock() {
         for frame in data.chunks(channels) {
-            let mono = frame.iter().map(|s| *s as f32 / i16::MAX as f32).sum::<f32>() / frame.len() as f32;
+            let mono = frame
+                .iter()
+                .map(|s| *s as f32 / i16::MAX as f32)
+                .sum::<f32>()
+                / frame.len() as f32;
             output.push(mono);
         }
     }

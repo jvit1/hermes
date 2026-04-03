@@ -1,9 +1,11 @@
 use anyhow::Result;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::core::HSTRING;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    DispatchMessageW, MessageBoxW, PeekMessageW, TranslateMessage, MB_ICONERROR, MB_OK, MSG,
+    PM_REMOVE,
 };
 
 mod settings_dialog;
@@ -97,9 +99,17 @@ pub fn pump_message_queue() {
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+pub fn show_error_dialog(title: &str, message: &str) {
+    let title = HSTRING::from(title);
+    let message = HSTRING::from(message);
+    unsafe {
+        let _ = MessageBoxW(HWND::default(), &message, &title, MB_OK | MB_ICONERROR);
     }
 }
 
