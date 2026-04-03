@@ -1,0 +1,3 @@
+Executable: hermes.exe
+Runtime dir: whisper-runtime
+Includes startup helper scripts: install-startup.ps1, remove-startup.ps1
