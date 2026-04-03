@@ -33,12 +33,12 @@ Current default behavior:
 ## Requirements
 
 - Windows 10 or 11
-- Rust toolchain with `cargo`
 - Python 3.10+
 - A working microphone
-- `whisper-cli.exe` from `whisper.cpp`
-- Whisper runtime DLLs next to `whisper-cli.exe`
-- A local Whisper model file
+
+For development from source:
+
+- Rust toolchain with `cargo`
 
 Required runtime files in `whisper-runtime/`:
 
@@ -62,7 +62,21 @@ Default model path:
 
 ## Setup
 
-### 1. Build the app
+### Quick start
+
+If you are not developing Hermes, download the latest Windows zip from GitHub Releases.
+
+If you already have `hermes.exe`, the normal setup is just:
+
+1. Run `hermes.exe`.
+2. Hermes creates `config.toml` automatically on first launch.
+3. If `whisper-cli.exe` and its DLLs are missing, Hermes tries to download the runtime automatically on startup.
+4. If the selected standard model is missing, Hermes can download it automatically when you transcribe for the first time or when you save settings.
+5. Use the tray menu or `hermes.exe --settings` to adjust model, hotkey, and typing behavior.
+
+For most users, that is enough. The main external requirement is that `py` or `python` is available on `PATH`, because Hermes uses an embedded Python helper for runtime and model downloads.
+
+### Build from source
 
 ```powershell
 cargo build --release
@@ -74,7 +88,13 @@ The executable will be written to:
 target\release\hermes.exe
 ```
 
-### 2. Provide the Whisper runtime
+You can also run directly from source:
+
+```powershell
+cargo run --release
+```
+
+### Manual runtime setup
 
 Place `whisper-cli.exe` and its required DLLs in:
 
@@ -84,7 +104,7 @@ whisper-runtime\
 
 The app expects the runtime DLLs to live next to `whisper-cli.exe`.
 
-If the runtime is missing, Hermes now tries to download the official Windows
+If the runtime is missing, Hermes tries to download the official Windows
 `whisper.cpp` release asset automatically by calling:
 
 ```powershell
@@ -93,7 +113,7 @@ python .\scripts\ptt_tooling.py ensure-runtime --runtime-dir .\target\release\wh
 
 You can also run that command yourself ahead of time.
 
-### 3. Download a model
+### Manual model setup
 
 Download the default model:
 
@@ -116,7 +136,7 @@ You can also download a model from the Settings dialog:
 - click `Download Selected Model`
 - the dialog will update `model_path` after the download completes
 
-### 4. Verify the local setup
+### Verify the local setup
 
 ```powershell
 python .\scripts\ptt_tooling.py verify-runtime
@@ -128,7 +148,7 @@ This checks:
 - required DLLs are present
 - the default model path exists
 
-### 5. Run diagnostics
+### Run diagnostics
 
 ```powershell
 python .\scripts\ptt_tooling.py diagnose
@@ -144,27 +164,42 @@ Diagnostics print:
 - language
 - microphone availability
 
-### 6. Launch the app
+### Launch options
 
-Foreground mode:
+Foreground:
 
 ```powershell
 cargo run --release
 ```
 
-If `whisper-cli.exe` is missing next to the built executable, the app will try
-to bootstrap `target\release\whisper-runtime\` automatically on startup.
+Or, if you already built the app:
 
-Background mode with hidden console:
+```powershell
+.\target\release\hermes.exe
+```
+
+Background with hidden console:
 
 ```powershell
 cargo run --release -- --background
 ```
 
-Open the settings dialog directly:
+Or:
+
+```powershell
+.\target\release\hermes.exe --background
+```
+
+Settings dialog:
 
 ```powershell
 cargo run --release -- --settings
+```
+
+Or:
+
+```powershell
+.\target\release\hermes.exe --settings
 ```
 
 ## Configuration
